@@ -127,6 +127,10 @@ As long as WAL disk usage stays below this setting, old WAL files are always rec
 at a checkpoint, rather than removed. This can be used to ensure that enough WAL space is reserved to 
 handle spikes in WAL usage, for example when running large batch jobs. 
 
+> ***checkpoint_flush_after (integer)*** 
+
+After every checkpoint_flush_after pages are written directly from shared buffers into the OS page cache, it issues an asynchronous `sync_file_range(SYNC_FILE_RANGE_WRITE)` hint to the kernel to start pushing those pages to the block device. This prevents a huge backlog from accumulating in the OS page cache so that the final fsync() at checkpoint end stays cheap. `sync_file_range(SYNC_FILE_RANGE_WRITE)` does not guarantee durability like fsync() does - it is a fire-and-forget hint that merely initiates write-out and returns immediately, without waiting for I/O completion or flushing the drive's volatile write cache.
+
 </details>
 
 ---
