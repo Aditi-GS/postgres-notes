@@ -17,6 +17,8 @@ Similar to the checkpointer, bgwriter:
 
 Bgwriter never calls fsync(). It calls write() only - to push pages from shared buffers to OS page cache. The checkpointers is incharge of pushing pages from shared buffers to stable disk storage.
 
+Both backends and the bgwriter forward their fsync() requests to the checkpointer via a shared-memory fsync requests queue. The checkpointer absorbs these periodically (every 1000 writes during the checkpoint loop, and continuously while idle) and issues the actual fsync() calls centrally. If the queue overflows, the caller falls back to doing its own fsync().
+
 `bgwriter_delay` parameter specifies the delay between activity rounds for the background writer. In each round the writer issues writes for some number of dirty buffers - controlled by the another parameter `bgwriter_lru_maxpages`. Setting `bgwriter_lru_maxpages` to 0 disables background writing.
 
 ```sql
