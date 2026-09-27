@@ -28,7 +28,7 @@ Transaction commit is normally synchronous: the server waits for the transaction
 
 However, for short transactions this delay is a major component of the total transaction time. Selecting asynchronous commit mode means that the server returns success as soon as the transaction is logically completed, before the WAL records it generated have actually made their way to disk. This can provide a significant boost in throughput for small transactions.
 
-Asynchronous commit introduces the risk of data loss (not data corruption). There is a short time window between the report of transaction completion to the client and the time that the transaction is truly committed. If the database should creash - it will recover by replaying WAL up to the last record that was flushed. The database will therefore be restored to a self-consistent state, but any transactions that were not yet flushed to disk will not be reflected in that state. The net effect is therefore loss of the last few transactions. Because the transactions are replayed in commit order, no inconsistency can be introduced. 
+Asynchronous commit introduces the risk of data loss (not data corruption). There is a short time window between the report of transaction completion to the client and the time that the transaction is truly committed. If the database should crash - it will recover by replaying WAL up to the last record that was flushed. The database will therefore be restored to a self-consistent state, but any transactions that were not yet flushed to disk will not be reflected in that state. The net effect is therefore loss of the last few transactions. Because the transactions are replayed in commit order, no inconsistency can be introduced. 
 
 The duration of the risk window is limited because a background process (the `WAL writer`) flushes unwritten WAL records to disk every `wal_writer_delay` milliseconds. The actual maximum duration of the risk window is `3 x wal_writer_delay` because the WAL writer is designed to favor writing whole pages at a time during busy periods.
 
@@ -38,27 +38,27 @@ The user can also select the commit mode of each transaction, so that it is poss
 
 When the `WAL writer` wakes, it doesn't flush all the records in the buffer blindly - it looks for the last complete page (8KB of WAL records/page) and flushes up until there - since it favors whole pages writes during heavy write load - because writing a full page is more I/O efficient that writing a partial one. If the current WAL page in the buffer is incomplete, the WAL writer skips it until next cycle until it is full. 
 
-Let's say the current async commit record falls in the middle of the current WAL page. In the worst case scenario (heavy load), in the first cycle the WAL writer skips this page and only flushes all the full pages before the current incomplete WAL page. In the second cycle, more WAL is written and let's assume the page containing the async commit record which signaled the WAL writer earlier is now full. The WAL writer still might decide to batch multiple whole pages together rather than flushing a single one - it might wait to coalesce multiple whole WAL pages into a single write. The third cycle is when the the WAL page containing the record is flushed in this worst case scenario. Hence `3 x wal_writer_delay`.
+Let's say the current async commit record falls in the middle of the current WAL page. In the worst case scenario (heavy load), in the first cycle the WAL writer skips this page and only flushes all the full pages before the current incomplete WAL page. In the second cycle, more WAL is written and let's assume the page containing the async commit record which signaled the WAL writer earlier is now full. The WAL writer still might decide to batch multiple whole pages together rather than flushing a single one - it might wait to coalesce multiple whole WAL pages into a single write. The third cycle is when the WAL page containing the record is flushed in this worst case scenario. Hence `3 x wal_writer_delay`.
 
 > Synchronous
 
-When `synchronous_commit=on` the backend calls `XlogFlush` itself upon commit to flush the WAL records in the WAL buffers to the `pg_wal` directory - only after persisting it on the disk does it send a success indication back to the client. `commit_delay` is a synchronous commit method that causes a delay just before the transation flushed WAL to the disk - in the hopes that a single flush invoked by such a transaction will batch other transactions commiting at the same time - within the interval introduced by it. 
+When `synchronous_commit=on` the backend calls `XlogFlush` itself upon commit to flush the WAL records in the WAL buffers to the `pg_wal` directory - only after persisting it on the disk does it send a success indication back to the client. `commit_delay` is a synchronous commit method that causes a delay just before the transaction flushed WAL to the disk - in the hopes that a single flush invoked by such a transaction will batch other transactions committing at the same time - within the interval introduced by it. 
 
 ### When triggered
 
-With `synchronous_commit=off` the backends don't write() + fsync() the WAL themselves. WAL writer guarantess the data durability by periodically flushing the WAL records from the WAL buffers in the shared memory to the disk. It acquires the `WALWriteLock LWLock` and calls `XlogWrite` which triggers synchronization via `issue_xlog_fsync` [ apart from the WAL writer, this is also triggered by `XlogInsertRecord` when the buffers are full and by `XlogFlush` during commits ].
+With `synchronous_commit=off` the backends don't write() + fsync() the WAL themselves. WAL writer guarantees the data durability by periodically flushing the WAL records from the WAL buffers in the shared memory to the disk. It acquires the `WALWriteLock LWLock` and calls `XlogWrite` which triggers synchronization via `issue_xlog_fsync` [ apart from the WAL writer, this is also triggered by `XlogInsertRecord` when the buffers are full and by `XlogFlush` during commits ].
 
-WAL writer perdiocally flushes WAL records to the disk every `wal_writer_delay` ms or immediately after `wal_writer_flush_after` bytes of WAL accumulates in the buffers. It write() [flush to the OS/Kernel cache] and then fsync()s` the records. 
+WAL writer periodically flushes WAL records to the disk every `wal_writer_delay` ms or immediately after `wal_writer_flush_after` bytes of WAL accumulates in the buffers. It write() [flush to the OS/Kernel cache] and then fsync()s` the records. 
 
-Even with `synchronous_commit=on` the WAL writer is still triggered in situtations like: 
+Even with `synchronous_commit=on` the WAL writer is still triggered in situations like: 
 
 1. WAL records generated by non-backend processes: 
 The checkpointer writes checkpoint records to the WAL and the startup process writes WAL during recovery/replay.
 
-2. WAL from ongoing (uncommited) transactions and avoid buffer exhaustion:
+2. WAL from ongoing (uncommitted) transactions and avoid buffer exhaustion:
 Long running transactions might have generated a large amount of WAL and not have committed yet. Backends trying to write new blocks of WAL are blocked until space frees if the buffers get full. WAL writer drains the buffers to the disk periodically in the background - preventing the buffers from filling up and also reducing the I/O burst that might happen at commit time.
 
-The methodn of fsync depends on the parameter `wal_sync_method`.
+The method of fsync depends on the parameter `wal_sync_method`.
 
 ### Relevant Server Configured Parameters: 
 <u>For detailed definitions</u>:
