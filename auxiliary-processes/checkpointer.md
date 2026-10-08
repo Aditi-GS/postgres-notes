@@ -36,7 +36,7 @@ The checkpoint record (WAL position, time, etc.) in `pg_control`. It doesn't "st
 
 - The checkpointer records the current WAL position as the REDO point (recovery start point). 
 - `REDO LSN` -> the LSN of XLOG (WAL)- the next record to be inserted at the moment checkpointer started. 
-- The checkpointer acquires all of the 8 `WALInsertLock LWLock` (***exclusive*** - blocks other processes from inserting wal records) briefly to capture the REDO LSN into a pointer stored in shared memory and then the checkpointer also stores the value of the variable in it's own local memory (to avoid re-reads from the shmem) and inserts the `XLOG_CHECKPOINT_REDO` record (has empty data portion - only to mark the start of checkpointing) via `XlogInsertRecord`.
+- The checkpointer acquires all of the 8 `WALInsertLock LWLock` (***exclusive*** - blocks other processes from inserting wal records) briefly to capture the REDO LSN into a pointer stored in shared memory and then the checkpointer also stores the value of the variable in it's own local memory (to avoid re-reads from the shmem) and inserts the `XLOG_CHECKPOINT_REDO` record (apart from int wal_level it has empty data portion - only to mark the start of checkpointing) via `XlogInsertRecord`.
 - It then releases the locks for other transactions to continue while it starts flushing (write() to OS/Kernel Cache and fsync() to the disk)[flushing to disk != deleting from buffers]
 - The checkpointer performs a single complete linear scan of the `BufferDescriptors[]` array in shared memory and checks the `state` field for `BM_DIRTY` label,
 indicating if the corresponding page the descriptor refers to is dirty (modified) or not.

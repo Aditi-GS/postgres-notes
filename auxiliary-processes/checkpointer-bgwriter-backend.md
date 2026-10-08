@@ -37,4 +37,6 @@ a checkpoint. One way to reduce the cost of full page writes is to increase the 
 fewer checkpoints -> fewer FPWs -> lesser WAL Volume. 
 This is mainly applicable to "hot" pages - pages that are refered to and modified often.
 
+Each page has an LSN (the WAL position of its last change). When logging a change, if page LSN <= REDO pointer, the page hasn't been logged since the checkpoint's REDO point, so include an FPI. After logging, the page LSN moves past REDO pointer, so subsequent changes skip it.
+
 ---
