@@ -1,3 +1,7 @@
+## For related labs refer to : 
+### [PostgreSQL-Labs](https://github.com/Aditi-GS/postgres-labs)
+---
+
 ## [Stages of a Query](./stages-of-a-query.md)
 
 ## File System Layout
