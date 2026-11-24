@@ -10,7 +10,7 @@
 
 > **What it does:**
 
-Flushes all dirty (modified) pages from shared_buffers to their data files on disk, then records the checkpoint's WAL position in `pg_control`. 
+Flushes the pages that were dirty when the checkpoint started (shared_buffers plus the SLRU caches such as CLOG) and fsyncs the resulting files, then writes a checkpoint record to WAL and records its position in `pg_control`.
 
 > **What it stores:**
 
@@ -28,37 +28,97 @@ The checkpoint record (WAL position, time, etc.) in `pg_control`. It doesn't "st
     SHOW max_wal_size;
     ```
 
-3. **Manual:** `CHECKPOINT`; command
+A checkpoint is begun every `checkpoint_timeout` seconds, or if `max_wal_size` is about to be exceeded, whichever comes first.
+
+While a checkpoint runs, it has two `deadlines` and aims to finish by whichever comes first:
+Time deadline: `target × checkpoint_timeout seconds/minutes`
+WAL deadline: `checkpoint_completion_target × N` segments of WAL written since the checkpoint started
+
+`CheckPointSegments` (How many segments of WAL trigger a checkpoint) = `N`
+`N  = max_wal_size / (1 + checkpoint_completion_target) segments`
+
+```
+|--- WAL generated before checkpoint 1     -----> WAL = W
+|
+REDO LSN 1 (start)
+| 
+|--- WAL generated during checkpoint 1      ----> WAL = X, Total WAL = (X + W)
+|
+CHECKPOINT LSN 1 (end)
+|
+|--- WAL generated before REDO LSN 1 are removed or recycled    ----> Total WAL = (X + W - W) = X
+|--- WAL generated between checkpoint 1's end & checkpoint 2's start (quiet phase) ----> Q
+|
+REDO LSN 2 (start)                      
+|
+|--- WAL generated during checkpoint 2      ----> WAL = Y, Total WAL = (X + Q + Y)
+|
+CHECKPOINT LSN 2 (end)
+|
+|--- The WAL generated before REDO LSN 2 are removed or recycle  ----> WAL = (X + Q + Y - X - Q) = Y
+```
+
+In a `WAL-driven steady, busy state` of `uniform rate of WAL`: 
+    X + Q ≈ N (previous REDO + quiet phase)
+    X ≈ Y ≈ target × N
+    Q ≈ (1 − target) × N
+
+Checkpoint 1 starts at REDO 1 and spreads its writes, paced against a deadline of target × N segments of WAL, so it generates X ≈ target × N.
+Checkpoint 1 ends. WAL keeps being generated (the quiet phase Q).
+The moment the insert position is N segments past REDO 1 (X + Q = N), checkpoint 2 is requested, even if `checkpoint_timeout` hasn’t elapsed.  
+
+If WAL is generated faster than the checkpoint is progressing, it falls behind its schedule (about `target × N` segments written) and stops sleeping between writes, writing as fast as I/O allows. If it still hasn't finished when WAL reaches N past its REDO point (slow I/O), checkpoint 2 is requested but has to wait, because only one checkpoint runs at a time. It starts immediately after checkpoint 1 ends, and WAL on disk exceeds `max_wal_size` meanwhile. This is why `max_wal_size` is a soft limit.
+
+3. **Manual:** `CHECKPOINT`; command (needs superuser or the `pg_checkpoint` role)
+
+A timed or WAL-triggered checkpoint is skipped if no important WAL has been written since the last checkpoint (idle system)
 
 ---
 
 ### Internal workings:
 
+#### Phase 1 : REDO + Identify Dirty + Flag for Write
 - The checkpointer records the current WAL position as the REDO point (recovery start point). 
 - `REDO LSN` -> the LSN of XLOG (WAL)- the next record to be inserted at the moment checkpointer started. 
-- The checkpointer acquires all of the 8 `WALInsertLock LWLock` (***exclusive*** - blocks other processes from inserting wal records) briefly to capture the REDO LSN into a pointer stored in shared memory and then the checkpointer also stores the value of the variable in it's own local memory (to avoid re-reads from the shmem) and inserts the `XLOG_CHECKPOINT_REDO` record (apart from int wal_level it has empty data portion - only to mark the start of checkpointing) via `XlogInsertRecord`.
+- The checkpointer acquires all of the 8 `WALInsertLock LWLock` (***exclusive*** - blocks other processes from inserting wal records) briefly to capture the REDO LSN into a pointer stored in shared memory and then the checkpointer also stores the value of the variable in it's own local memory (to avoid re-reads from the shmem) and inserts the `XLOG_CHECKPOINT_REDO` record (apart from int wal_level it has empty data portion - only to mark the start of checkpointing) via `XLogInsertRecord`.
 - It then releases the locks for other transactions to continue while it starts flushing (write() to OS/Kernel Cache and fsync() to the disk)[flushing to disk != deleting from buffers]
-- The checkpointer performs a single complete linear scan of the `BufferDescriptors[]` array in shared memory and checks the `state` field for `BM_DIRTY` label,
+- The checkpointer performs a single complete linear scan of the `BufferDescriptors[]` array in shared memory.For each one, it takes the buffer header spinlock and checks the `state` field for `BM_DIRTY` label,
 indicating if the corresponding page the descriptor refers to is dirty (modified) or not.
+- For every dirtied buffer it encountered, it **sets the state to `BM_CHECKPOINT_NEEDED`** (must write for checkpoint) and records an entry in a sort array: 
+`tablespace OID, relfilenode, forknum, blocknum, buf_id`
+- This array is allocated in shared memory at server startup, so a large allocation can never make a checkpoint fail.
 - During it's linear scan, it builds a local array where it stores the `buf_id, relfilenode, forknum, blocknum` of every dirty buffer slot it comes across.
-- This local array is later sorted by it's physical location - to turn random I/O into roughly sequential I/O.
-- The checkpointer later walks the `sorted local array` again. It pins it (increment the `pin count`) to prevent `clock-sweep eviction` mid-write - a pinned buffer slot can't be chosen as a candidate by clock-sweep eviction.
-- To recheck the `state` - so that it can skip buffers which are now clean because of bgwriter or other backends (due eviction) - it acquires the `buffer header spinlock` and checks if it's still `BM_DIRTY`. If it is `BM_IO_IN_PROGRESS` then it skips again because the bgwriter or any backends can be flushing the page instead. Otherwise, it set's the state to `BM_IO_IN_PROGRESS` (to claim the buffer for write()) and releases the spinlock.
-- It later acquires the buffer's `content_lock LWLock` in `shared mode (read-only)` that even backends use to modify pages.
+- From here on `BM_CHECKPOINT_NEEDED` is what defines which pages the checkpoint must write - not `BM_DIRTY`. This allows it to write only those pages that were dirty when the checkpoint began, and not those that get dirtied while it proceeds.
 
 #### <u>Note 1</u>:
 > Pages dirtied mid-scan (after the scan pointer has already passed them) are not in this checkpoint's array; they'll be caught by the next checkpoint. This is safe because the REDO LSN was set before the scan, so any WAL record referencing a page dirtied during the checkpoint has an LSN after the redo point and will be replayed during recovery if needed.
 
-- The checkpointer gradually flushes the buffers to the disk - spread writes over `checkpoint_completion_target` `×` `checkpoint_timeout` - hence the I/O rate is dynamically adjusted so that the checkpoint finishes when the given fraction of `checkpoint_timeout` seconds have elapsed, or before `max_wal_size` is exceeded, whichever is sooner. Regardless of `checkpoint_timeout`, all dirty pages (since checkpointing began) are flushed onto stable storage - even if it's past the `checkpoint_timeout`.
-- The exact `relfilenode`, the `block number` and `fork number` is already known from the descriptor.
-- Once flushed onto the disk it unpins and releases the lock. This guarantees that all dirty pages are fsynced and have persisted on disk.
+#### Phase 2 : Sort + Re-scan & Re-check + write()
 
-#### <u>Note 2</u>:
-> If WAL pressure is high and `max_wal_size` is about to be hit, the checkpointer compresses its write window to finish before the next WAL-forced checkpoint. For WAL-forced checkpoints specifically, checkpoint_completion_target is not honored - the checkpointer flushes as fast as I/O allows to reclaim WAL space. Regardless of timing, all pages that were dirty at checkpoint start are guaranteed to be flushed before the checkpoint record is written.
+- The array is sorted by **tablespace, relfilenode, fork, block number**, which turns random I/O into mostly sequential I/O.
+
+For each entry in the now sorted array: 
+
+- If the buffer no longer has `BM_CHECKPOINT_NEEDED`, skip it - because apart from the obvious checkpointer, backend processes (as a part of eviction) and bgwriter can clear out this flag too.
+- The checkpointer then locks the header and re-checks that the buffer is still valid and dirty. Then it **pins** the buffer (a pinned buffer cannot be chosen by clock-sweep eviction) and takes its' **`content_lock` in shared mode**. Backends modify a page while holding that lock in **exclusive mode**, so taking it **shared mode** makes the checkpointer wait out any modification and guarantees the page image it writes is consistent. Concurrent readers are not blocked. 
+- It then sets the **state to `BM_IO_IN_PROGRESS` to claim the write. If someone else is already writing this buffer, it waits it out. If the buffer turns out clean afterwards, it does nothing.
+- The checkpointer gradually flushes the buffers to the disk - spread writes over `checkpoint_completion_target` `×` `checkpoint_timeout` - hence the I/O rate is dynamically adjusted so that the checkpoint finishes when the given fraction of `checkpoint_timeout` seconds have elapsed, or before `max_wal_size` is exceeded, whichever is sooner.
+- Regardless of `checkpoint_timeout`, all dirty pages (since checkpointing began) are flushed onto stable storage - even if it's past the `checkpoint_timeout`.
+- It `write()`s the page to the OS cache and then clears the `BM_CHECKPOINT_NEEED` flag (unless the page was re-dirties during the write). 
+- The checkpointer then releases the content lock, unpins and schedules a writeback hint for the block range `checkpoint_flush_after`
+- After each buffer, the write delay `CheckpointWriteDelay` is called with progress = buffers processes / buffers to write. It sleeps if the checkpoint is ahead of schedule and doesn't if it is behing (any of the 2 deadlines from the triggered sectiona above)
+
+#### Phase 3 : Fsync
+- During the buffer loop, the checkpointer only `write()`s pages into the OS cache and each written file is registered as needing a fsync. This kept a track off in a `pending fsync requests queue`.
+- Requests form backends and bgwriter that wrote the pages themselves are forwarded to the checkpointer.
+- Once all the pages from the sorted array are written to the OS cache - all the pending requests are fsynced as a batch.
+- Because the fsyncs (step 2) happen before the checkpoint record is inserted and flushed (step 5), and `pg_control` is updated only after that, any checkpoint that `pg_control` points to has all its pre-REDO page changes on stable storage. If the server crashes mid-checkpoint, `pg_control` still points to the previous checkpoint, so recovery starts from there.
+
+
 
 ---
 
-- The checkpointer now inserts (`WALInsertLock`, `XlogInsertRecord`) the checkpoint record `XLOG_CHECKPOINT_ONLINE` to WAL. Though part of the WAL stream, we can differentiate checkpoint record from a WAL record because:
+- The checkpointer now inserts (`WALInsertLock`, `XLogInsertRecord`) the checkpoint record `XLOG_CHECKPOINT_ONLINE` to WAL. Though part of the WAL stream, we can differentiate checkpoint record from a WAL record because:
 
 | | WAL Record | Checkpoint Record |
 |---|---|---|
@@ -82,8 +142,7 @@ indicating if the corresponding page the descriptor refers to is dirty (modified
 ---
 
 - After checkpointing, the old WAL files are no longer required for crash recovery and hence are eligible for deletion (unlinking from the disk) or recycling/renamed (if `wal_recycle=on`).
-- Internally though, WAL files older than ***previous checkpoint*** are deleted/recycled. The number of these WAL segments 
-recycled is controlled by `min_wal_size` parameter.
+- Internally though, WAL files older than ***previous checkpoint*** are deleted/recycled. The number of these WAL segments recycled is controlled by `min_wal_size` parameter.
 
 ```sql
 SHOW min_wal_size;
@@ -103,7 +162,7 @@ SHOW min_wal_size;
 
 ### If WAL generation rate is high enough that `max_wal_size` is exhausted before `checkpoint_timeout` elapses ?
 
-1. A WAL-forced checkpoint is requested - a single int bitmask flag in shmem is set to indicate the request.
+1. A WAL-forced checkpoint is requested - a single int bitmask flag `ckpt_flags` inside `CheckpointShmemStruct` in shmem is set to indicate the request.
 2. Since only one checkpoint can run at a time and the checkpointer is already busy, the set flag simply sits in the shmem. If multiple requests to the checkpointer are made during the current ongoing checkpointing - each ORs the same bits into flag - the operation is idempotent, so they collapse into a single pending request.
 3. During the on-going checkpointing, no segments are recycled. If backends exhaust all available segment files in `pg_wal`, they block waiting for the next segment to be recycled - leading to writes' stall. The `checkpoint_warning` logs a hint when checkpoints are firing closer than their threshold, signaling that `max_wal_size` should be increased.
 4. Upon completion of the current checkpointing, the checkpointer checks the non-zero flag and immediately starts the next checkpoint without any sleep or delay. This next checkpoint recycles segments.
@@ -131,8 +190,7 @@ checkpoint completion and the next scheduled checkpoint.
 
 > ***max_wal_size (integer)*** 
 
-Maximum size to let the WAL grow during automatic checkpoints.
-This is a soft limit; WAL size can exceed max_wal_size under special circumstances, such as heavy load, a failing archive_command or archive_library, or a high wal_keep_size setting. 
+Maximum size to let the WAL grow during automatic checkpoints. It spans 2 checkpoints - from the previous checkpoint's REDO start LSN till the current checkpoint's end LSN. It's also the total WAL budget you're willing to replay after a crash. This is a soft limit; WAL size can exceed max_wal_size under special circumstances, such as heavy load, a failing archive_command or archive_library, or a high wal_keep_size setting. 
 Increasing this parameter can increase the amount of time needed for crash recovery.
 
 > ***min_wal_size (integer)*** 

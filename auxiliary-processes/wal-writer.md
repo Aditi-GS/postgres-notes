@@ -32,6 +32,17 @@ Asynchronous commit introduces the risk of data loss (not data corruption). Ther
 
 The duration of the risk window is limited because a background process (the `WAL writer`) flushes unwritten WAL records to disk every `wal_writer_delay` milliseconds. The actual maximum duration of the risk window is `3 x wal_writer_delay` because the WAL writer is designed to favor writing whole pages at a time during busy periods.
 
+Here's the worst-case sequence:
+
+- Cycle 1 (T + 1×delay): 
+    An async commit lands in the current (partially filled) WAL page. The WAL writer wakes up, sees fully-filled pages before the current one, writes those, but skips the current partial page (it favors whole pages to reduce I/O under load).  The commit record is not yet on disk.
+- Cycle 2 (T + 2×delay): 
+    The writer wakes up again. More WAL has accumulated. The current page may still be partial, or the writer's "write stops at the end of the cache ring" behavior means it hasn't cycled back around to flush it. The commit record is still not flushed.
+- Cycle 3 (T + 3×delay): 
+    The writer wakes up and must flush up to the current position (the page is now full, or the time-based trigger forces a full flush). The commit record finally reaches disk.
+
+In short: the basic time-based rule alone would bound the window at 2× (miss one cycle, catch the next). The whole-page optimization adds one extra cycle because the writer deliberately defers the partial page containing the async commit, yielding the 3× worst case. At the default 200 ms, that's 600 ms of exposure. 
+
 The user can also select the commit mode of each transaction, so that it is possible to have both synchronous and asynchronous commit transactions running concurrently. But certain utility commands, like `DROP TABLE` are forced to commit synchronously regardless of the set mode to ensure consistency between server's file system and logical state of the database. 
 
 > Why 3 x wal_writer_delay ?
@@ -42,7 +53,7 @@ Let's say the current async commit record falls in the middle of the current WAL
 
 > Synchronous
 
-When `synchronous_commit=on` the backend calls `XlogFlush` itself upon commit to flush the WAL records in the WAL buffers to the `pg_wal` directory - only after persisting it on the disk does it send a success indication back to the client. `commit_delay` is a synchronous commit method that causes a delay just before the transaction flushed WAL to the disk - in the hopes that a single flush invoked by such a transaction will batch other transactions committing at the same time - within the interval introduced by it. 
+When `synchronous_commit=on` the backend calls `XlogFlush` itself upon commit to flush the WAL records in the WAL buffers to the `pg_wal` directory - only after persisting it on the disk does it send a success indication back to the client. `commit_delay` is a synchronous commit method that causes a delay just before the transaction flushed WAL to the disk - in the hopes that a single flush invoked by such a transaction will batch other transactions committing at the same time - within the interval introduced by it. If the `wal_buffers` fill up before the COMMIT then the backend calling `XLogInsertRecord` must write out (to the OS page cache) a few filled WAL buffer pages to make room. It happens while the backend holds an exclusive lock on the data page - so the lock is held longer, increasing contention. It may also trigger WAL segment file creation (a new 16 MB file), which is even more expensive (file creation + first write). PostgreSQL tracks this as `wal_buffers_full` in `pg_stat_wal`. If this counter keeps growing, `wal_buffers` is too small. 
 
 ### When triggered
 

@@ -145,7 +145,7 @@ Are present for each shared buffer slot and stores metadata of the cached data p
 |---|---|
 | `tag` | Which page is in the slot (relation OID, block number) |
 | `buf_id` | It's own buffer slot index |
-| `state` (32-bit) | Packed into one word it indicate how many backends are asking for it (refcount), how "hot" is the data page (usage_count) and whether the page is `BM_DIRTY`, `BM_VALID`, `BM_IO_IN_PROGRESS`, `BM_CHECKPOINT_NEEDED`, etc (flag) |
+| `state` (32-bit) | Packed into one word it indicate how many backends are asking for it (refcount), how "hot" is the data page (usage_count) and whether the page is `BM_DIRTY`, `BM_VALID`, `BM_IO_IN_PROGRESS`, etc (flag) |
 
 Buffer Hash Table is another structure present along with shared buffers and buffer descriptor. It tracks which object/relation is in which slot index in the shared buffers - it is keyed on (relation OID, fork number, block number).
 
@@ -154,9 +154,18 @@ Each slot in shared buffer stores a pair - a descriptor and the actual 8KB page.
 ---
 
 ### Notes: 
-**Light Weight Locks**
+1. **Light Weight Locks**
 
 LWLocks are transient - lasting only few micro-nanoseconds while internal processes manipulate data in the memory. They aren't visible in `pg_locks` but can be monitored via `pg_stat_activity -> wait_event_type='lwlock'`. They are fine-grained - the scope of each individual LWLock is narrow - protecting only a small unit of shared structure like - per page, per buffer slot, etc. This allows multiple backend processes operate in parallel on different parts of the shared structure at the same time. Their fine grained design helps acheive maximum concurrency but when a single resource - like a page - is hammered by multiple backends in short amount of time - the page remains "hot" causing reduction in performance or bottlenecks. Backends wait until the LWLock released for few microseconds and if not released, it goes to sleep until the OS informs the release of the lock.
+
+2. **Table and Row Level Locks and Tuple Visibility**
+- When a transaction locks a row, it writes its own transaction ID (XID) into the row's t_xmax field and sets flag bits in t_infomask (e.g., HEAP_XMAX_LOCK_ONLY) to say "this xmax is a locker, not a deleter." 
+- This lives in the data page on disk, so there's no memory limit — you can lock as many rows as you want.
+- Readers still see the row because the visibility check recognizes the lock-only flag.
+- The shared-memory lock table can't store per-row locks, but it can store a small number of "tuple locks" (one per waiting backend, via LockTuple()). Its job is purely coordination - tracks the small number of backends that are actively waiting, so it never overflows.
+- When a transaction finds a row already locked by another backend, it takes a heavyweight tuple lock on that row's TID and then sleeps - waiting for the backend to commit or abort. Once it does, all the heavyweight locks are released - waking the waiters that are queued in order. 
+- The buffer content lock (an LWLock) is held only for the few microseconds it takes to physically write the XID + flag bits into the tuple header on the page. Then it's released immediately.
+
 
 ## Per-Backend Memory Components
 
